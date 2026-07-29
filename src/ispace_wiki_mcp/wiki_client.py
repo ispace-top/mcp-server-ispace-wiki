@@ -89,6 +89,7 @@ class WikiClient:
         headers = {
             "X-Requested-With": "XMLHttpRequest",
             "Accept": "application/json",
+            "Referer": self.base_url + "/",
         }
         resp = self._session.post(url, data=data, headers=headers, timeout=timeout)
         self._extract_csrf(resp.text)
