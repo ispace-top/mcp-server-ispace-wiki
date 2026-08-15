@@ -16,6 +16,34 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger(__name__)
 
 
+def _extract_js_string(text: str, var: str) -> Optional[str]:
+    """Extract a ``window.<var> = '...'`` value and decode JS/escapejs escapes.
+
+    The wiki template embeds document data as single-quoted JS string literals
+    (``window._docName = '...'``) using Django's ``escapejs`` filter, which
+    encodes special characters as ``\\uXXXX``.  This helper matches either quote
+    style and decodes those escapes back to plain text.
+    """
+    for quote in ("'", '"'):
+        m = re.search(
+            r"window\." + re.escape(var) + r"\s*=\s*"
+            + quote + r"((?:[^" + quote + r"\\]|\\.)*)" + quote,
+            text, re.S,
+        )
+        if m:
+            raw = m.group(1)
+            break
+    else:
+        return None
+
+    # Django escapejs encodes these as \uXXXX; decode those first.
+    raw = re.sub(r"\\u([0-9a-fA-F]{4})", lambda mm: chr(int(mm.group(1), 16)), raw)
+    # Then decode common JS string escapes.
+    raw = raw.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+    raw = raw.replace("\\/", "/").replace('\\"', '"').replace("\\'", "'").replace("\\\\", "\\")
+    return raw
+
+
 class WikiClient:
     """Low-level HTTP client for iSpace Wiki."""
 
@@ -154,15 +182,15 @@ class WikiClient:
         for script in scripts:
             text = script.string or ""
             for var, key in extractors.items():
-                m = re.search(r'window\.' + re.escape(var) + r'\s*=\s*"((?:[^"\\]|\\.)*)"', text)
-                if m:
-                    val = m.group(1)
-                    val = val.replace("\\n", "\n").replace("\\r", "\r").replace('\\"', '"').replace("\\\\", "\\")
+                val = _extract_js_string(text, var)
+                if val is not None:
                     data[key] = val
 
-            m = re.search(r"window\._inlineParentDoc\s*=\s*(\d+)", text)
-            if m:
-                data["parent_id"] = int(m.group(1))
+            for var in ("_docParentDoc", "_inlineParentDoc"):
+                m = re.search(r"window\." + re.escape(var) + r"\s*=\s*(\d+)", text)
+                if m:
+                    data["parent_id"] = int(m.group(1))
+                    break
 
         csrf_input = soup.find("input", attrs={"name": "csrfmiddlewaretoken"})
         if csrf_input:
@@ -190,20 +218,38 @@ class WikiClient:
 
     def update_document(self, doc_id: int, name: str = None, content: str = None,
                         pre_content: str = None, status: int = None,
-                        tags: str = None, parent_id: int = 0,
+                        tags: str = None, parent_id: Optional[int] = None,
                         editor_mode: int = 2) -> dict:
+        """Update document fields, preserving anything not explicitly provided.
+
+        The edit endpoint overwrites content/pre_content with whatever is POSTed
+        (empty string if omitted), so we must supply the current values when the
+        caller only wants to change one field.  Markdown source (pre_content) is
+        read back reliably via the export endpoint rather than scraping the page.
+        """
         current = self.get_page_data(doc_id)
-        final_name = name if name is not None else current.get("name", "")
-        final_content = content if content is not None else current.get("content", "")
-        final_pre_content = pre_content if pre_content is not None else current.get("pre_content", final_content)
-        final_tags = tags if tags is not None else current.get("tags", "")
+        final_name = name if name is not None else (current.get("name") or "")
+        final_tags = tags if tags is not None else (current.get("tags") or "")
+
+        if content is None or pre_content is None:
+            try:
+                md = self.export_document(doc_id, "md").decode("utf-8")
+            except Exception:
+                md = (current.get("pre_content") or current.get("content") or "")
+        final_content = content if content is not None else md
+        final_pre_content = pre_content if pre_content is not None else md
+
+        # Empty parent_doc leaves the document in its current parent (the backend
+        # keeps the existing value when the field is absent).  Sending 0 here would
+        # silently move the document to the root level.
+        parent_doc = str(parent_id) if parent_id is not None else ""
 
         payload = (
             f"doc_id={doc_id}"
             f"&doc_name={requests.utils.quote(final_name or '', safe='')}"
             f"&content={requests.utils.quote(final_content or '', safe='')}"
             f"&pre_content={requests.utils.quote(final_pre_content or '', safe='')}"
-            f"&parent_doc={parent_id}"
+            f"&parent_doc={parent_doc}"
             f"&doc_tag={requests.utils.quote(final_tags or '', safe='')}"
             f"&status={status if status is not None else 1}"
             f"&editor_mode={editor_mode}"
@@ -212,6 +258,7 @@ class WikiClient:
         headers = {
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"{self.base_url}/pages/{doc_id}/",
         }
         resp = self._session.post(f"{self.base_url}/documents/{doc_id}/edit/",
                                   data=payload, headers=headers, timeout=30)
@@ -390,6 +437,10 @@ class WikiClient:
         url = f"{self.base_url}/documents/{doc_id}/diff/{history_id}/"
         resp = self._session.post(url, data={
             "csrfmiddlewaretoken": self._csrf_token or "",
+        }, headers={
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json",
+            "Referer": f"{self.base_url}/pages/{doc_id}/",
         }, timeout=30)
         try:
             return resp.json()
