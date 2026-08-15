@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-server-ispace-wiki"
-version = "1.0.0"
+version = "1.1.0"
 description = "MCP Server for 爱思文档 (iSpace Wiki) — AI-driven document management"
 readme = "README.md"
 license = { text = "MIT" }
